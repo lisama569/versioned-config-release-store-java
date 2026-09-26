@@ -1,0 +1,226 @@
+# 可持久化配置版本发布系统 — 设计说明
+
+## 1. 总览
+
+本服务在 Spring Boot 3 / JDK 21 上实现一套带版本记录与发布工作流的配置中心内核，
+默认使用内嵌 H2 文件库（`./data/configstore`）持久化，无需任何外部服务即可运行与测试。
+
+核心能力：
+
+1. **配置条目**的创建、修改，每次变更在同一事务内追加一条不可变版本记录；
+2. **发布工作流** `DRAFT -> PENDING -> PUBLISHED -> ROLLED_BACK`，非法迁移被明确拒绝；
+3 发布请求按 `requestId` 幂等，重复提交结果与首次一致、不重复生效；
+4. **键集（keyset）分页**遍历条目与版本时间线，持续写入下不重复、不遗漏；
+5. 历史数据补充新字段后具有确定、稳定的兼容语义。
+
+包结构：
+
+| 包 | 职责 |
+|---|---|
+| `domain` | JPA 实体与状态机：`ConfigEntry` / `ConfigRevision` / `Release` / `ReleaseItem` |
+| `repo` | Spring Data 仓库，含键集分页 JPQL |
+| `service` | `ConfigService` / `ReleaseService` 事务用例，`ReleaseCreationTx` 发布单创建事务边界，`Clock` 时间源 |
+| `service.error` | `ConflictReason`（可区分错误码）与 `BusinessException` |
+| `support` | `Cursors` 游标编解码、`CursorPage`、`KeyedLocks` 分段锁 |
+| `api` | 请求/响应 record（DTO/View） |
+| `web` | REST 控制器与全局异常映射 |
+
+---
+
+## 2. 数据模型
+
+建表脚本是确定性的 `src/main/resources/schema.sql`（`CREATE TABLE IF NOT EXISTS`，
+`spring.jpa.hibernate.ddl-auto=none`），列名遵循 Spring 的驼峰转下划线策略。
+
+### 2.1 config_entry（配置条目当前态）
+
+| 列 | 说明 |
+|---|---|
+| `seq` | 数据库 IDENTITY 主键，**全局严格单调递增**，也是分页决胜键 |
+| `config_key` | 业务键，唯一（`uk_entry_key`） |
+| `config_value` | 当前值（列名避开 SQL 保留字 `value`） |
+| `description` | 后补字段，历史行可能为 NULL |
+| `category` | 后补字段，DDL 默认 `'DEFAULT'` |
+| `status` | `DRAFT` / `ARCHIVED` |
+| `value_version` | **业务版本号**，从 1 开始，每次成功修改 +1（与 JPA 乐观锁是两个概念） |
+| `format_version` | 行格式代数，新建恒为 2；历史 v1 行由默认值补为 1 |
+| `created_at` / `updated_at` | 毫秒精度时间戳（见 §6） |
+| `optimistic_version` | JPA `@Version` 乐观锁 |
+
+### 2.2 config_revision（版本记录，append-only）
+
+每次创建/修改/回滚，在**同一事务**内追加一行：
+
+- `change_type`：`CREATE` / `UPDATE` / `RESTORE`（回滚恢复专用，可解释）
+- `version_from` / `version_to`：变更前后的业务版本号
+- `old_value` / `new_value`、`operator`、`created_at`
+
+由于与条目更新共享事务，不可能出现"条目已更新但缺版本记录"的半更新状态。
+
+### 2.3 release_order（发布单）与 release_item（条目快照）
+
+- `release_order.request_id` 唯一（幂等键）；`state` 为状态机当前态；`@Version` 乐观锁。
+- `release_item` 对发布时每个条目冻结两份信息：
+  - 创建发布单时：`value_at_create`、`value_version_at_create`；
+  - 发布瞬间：`value_version_at_publish`（回滚前置条件的依据）。
+
+---
+
+## 3. 状态机与合法迁移
+
+```
+   DRAFT ──submit──▶ PENDING ──publish──▶ PUBLISHED ──rollback──▶ ROLLED_BACK(终态)
+```
+
+只有以上三条迁移合法，其余一律抛 `ILLEGAL_STATE_TRANSITION`。迁移合法性由
+`Release.canTransitionTo / transitionTo` 集中判定。
+
+**幂等重放边界**（避免"非法操作被静默吞掉"）：
+
+| 操作 | 合法迁移 | 幂等 no-op（返回当前态、无副作用） | 其它状态 |
+|---|---|---|---|
+| submit | DRAFT→PENDING | 已处于 PENDING | PUBLISHED/ROLLED_BACK → 拒绝 |
+| publish | PENDING→PUBLISHED | 已处于 PUBLISHED | DRAFT/ROLLED_BACK → 拒绝 |
+| rollback | PUBLISHED→ROLLED_BACK | 已处于 ROLLED_BACK | DRAFT/PENDING → 拒绝 |
+
+回滚语义：把每个条目值恢复为**发布单创建时冻结的值**，并追加一条 `RESTORE` 版本记录。
+若发布之后条目又被修改（当前业务版本 ≠ 发布时版本），以 `ROLLBACK_PRECONDITION_FAILED`
+拒绝，避免把发布后的新修改静默覆盖。
+
+---
+
+## 4. 并发约束与失败原因（可区分）
+
+两层并发控制，错误原因互不混淆：
+
+1. **唯一索引** `uk_entry_key`：并发创建同一 key，只有一个事务成功，
+   其余落 `ENTRY_KEY_DUPLICATE`（应用层先做一次可读检查，数据库兜底）。
+2. **JPA 乐观锁** `@Version`：并发修改同一行，提交时只有一个生效，
+   其余落 `VERSION_CONFLICT`。
+3. **业务版本 CAS** `expectedVersion`：调用方基于过期业务版本修改 → `VERSION_CONFLICT`。
+4. **值条件** `expectedValue`：以为没人改过值但现值已变 → `VALUE_MISMATCH`。
+
+| `ConflictReason` | HTTP | 触发场景 |
+|---|---|---|
+| `ENTRY_NOT_FOUND` / `RELEASE_NOT_FOUND` | 404 | 目标不存在 |
+| `ENTRY_KEY_DUPLICATE` | 409 | key 唯一冲突 |
+| `VERSION_CONFLICT` | 409 | 乐观锁 / 业务版本 CAS 失败 |
+| `VALUE_MISMATCH` | 409 | expectedValue 与现值不符 |
+| `ILLEGAL_STATE_TRANSITION` | 409 | 非法状态迁移（含并发下状态已被他人推进） |
+| `EMPTY_RELEASE` | 409 | 发布单不含任何条目 |
+| `ENTRY_NOT_RELEASABLE` | 409 | 条目非 DRAFT，不可纳入发布 |
+| `ROLLBACK_PRECONDITION_FAILED` | 409 | 发布后被改过，拒绝回滚覆盖 |
+| `IDEMPOTENCY_KEY_MISMATCH` | 409 | 同一 requestId 携带不同请求体 |
+
+**原子性**：所有写用例都是单个 `@Transactional` 方法。任何一步抛异常，事务回滚，
+不会留下部分写入或半更新；成功提交时条目与其版本记录同时可见。
+
+**创建发布单的锁-事务边界（重点）**：`requestId` 查重 + 插入是典型的 check-then-act。
+若锁加在事务方法内部，锁会在事务提交前释放，后来者读不到前者未提交的结果从而重复插入。
+因此 `ReleaseService.create` **本身不加事务**，先用 `KeyedLocks`（按 requestId 分段的
+进程内 `ReentrantLock`）加锁，再调用独立 bean `ReleaseCreationTx.createInTransaction`
+上的 `@Transactional` 方法。锁横跨整个事务：锁释放时事务已经提交，后来者必读到结果，
+于是"第一个真正创建、其余命中既有单走幂等重放"，物理上始终只有一行。
+数据库唯一索引 `uk_release_request` 作为跨进程/多实例的兜底。
+（配置条目的并发创建语义不同——同 key 的第二个创建本就应被拒绝，直接由唯一索引抛
+`ENTRY_KEY_DUPLICATE`，无需重放锁。）
+
+**幂等**：创建发布单先按 `requestId` 查；存在且条目集合+备注一致则返回首次结果，
+不一致则 `IDEMPOTENCY_KEY_MISMATCH`。状态迁移的重放见 §3。
+
+---
+
+## 5. 分页：不重复、不遗漏
+
+采用键集分页（keyset / seek pagination），不使用会跳数据的 OFFSET。
+
+- **条目列表 / 发布单列表**：排序键 `(created_at, seq)`。`created_at` 为主序，
+  `seq` 为同毫秒决胜键且全局唯一，因此排序键全局唯一、单调。
+  游标为可读明文 `"<createdAtMillis>_<seq>"`，下一页查询条件是严格大于游标位置。
+- **单条目版本时间线**：该条目的版本记录按写入顺序追加，故直接以该条目内的 `seq`
+  为游标（不能用全局 `(created_at, seq)`，否则其他更早日条目的记录会串进窗口）。
+- 每页多取 1 条（`limit+1`）判定是否还有下一页；最后一页 `nextCursor = null`。
+
+语义保证：排序键单调且游标为"严格上界"。遍历开始后新写入的行其排序键必然更大，
+落在所有尚未取到的页之后，因此已遍历行不会重复，且继续翻页必能取到新行，无遗漏。
+注意：调用方应从上一页返回的游标继续，而不是自行构造。
+
+---
+
+## 6. 历史数据兼容规则
+
+新增字段时保持确定、稳定、与读取次数无关的语义：
+
+- `description`：历史行物理上为 NULL，**读取时稳定归一化为空串 `""`**；
+- `category`：DDL 默认 `'DEFAULT'`；对 NULL 或纯空白也稳定归一化为 `"DEFAULT"`；
+  非空值原样保留；
+- `format_version`：历史 v1 行由 DDL 默认值补为 1，新写入恒为 2；
+  View 中 `max(format_version,1)` 保证读到的代数至少为 1；
+- 时间戳统一经 `Clock.now()` 截断到**毫秒**：底层 TIMESTAMP 精度有限，
+  若写带纳秒的值，读回精度变化会让"重放响应逐字段一致"不稳定。
+
+兼容逻辑集中在 `ConfigService`（`normalizeCategory` 为公开稳定方法），
+由 `LegacyCompatibilityTest` 用原生 JDBC 插入"只含 v1 列"的旧行来验证。
+
+---
+
+## 7. REST API 摘要
+
+```
+POST   /api/entries                       创建条目（body: key,value,description,category）
+PUT    /api/entries/{key}                 修改（可带 expectedVersion / expectedValue）
+GET    /api/entries/{key}                 查单条
+GET    /api/entries?cursor=&limit=        键集分页
+GET    /api/entries/{key}/revisions       该条目版本时间线（seq 游标）
+
+POST   /api/releases                      创建发布单（requestId, entryKeys, remark），幂等
+POST   /api/releases/{id}/submit          DRAFT -> PENDING
+POST   /api/releases/{id}/publish         PENDING -> PUBLISHED
+POST   /api/releases/{id}/rollback        PUBLISHED -> ROLLED_BACK
+GET    /api/releases/{id}                 查询
+GET    /api/releases?cursor=&limit=       键集分页
+```
+
+错误响应体：`{ "timestamp", "status", "code", "message" }`，`code` 即 §4 的错误码。
+
+---
+
+## 8. 验证方法
+
+### 8.1 全本地、无外部依赖
+
+```bash
+mvn -o test                 # 离线跑全部单测/集成测试（H2 内存库，可稳定重复）
+```
+
+测试（共 24 个，见 `src/test/.../tests`）：
+
+| 测试类 | 覆盖 |
+|---|---|
+| `ConfigConcurrencyTest` | 8 线程并发修改仅一个生效，其余 `VERSION_CONFLICT`；`VALUE_MISMATCH` / `ENTRY_KEY_DUPLICATE` / `ENTRY_NOT_FOUND` 可区分；版本记录数与业务版本严格一致（无半更新） |
+| `ReleaseLifecycleTest` | 四态全流程；各非法迁移；submit/publish/rollback 重放不重复生效；同 requestId 不同负载被拒；同 requestId 并发提交只落一行且全部返回同一发布单；发布后再改则回滚前置条件失败；空发布单/缺条目 |
+| `PaginationTest` | 同毫秒 seq 决胜；满页/末页边界；畸形游标拒绝；版本时间线页数精确；遍历过程中持续写入不重不漏 |
+| `LegacyCompatibilityTest` | JDBC 插入 v1 旧行，验证 DDL 默认值 + 归一化的确定语义 |
+| `WebApiTest` | 真实 HTTP：404/409/400 与错误码、重放响应逐字段一致、状态机、回滚后值恢复 |
+
+测试日志用 SLF4J 打印 **输入**（key、版本、期望值、requestId、entryKeys 等）与
+**判定依据/结果**（接受或拒绝原因、页码与游标），例如：
+
+```
+updateEntry input: key=k, currentVersion=1, expectedVersion=99, expectedValue=<absent>
+business rejection: reason=VERSION_CONFLICT, status=409, message=expected version 99 ...
+page decided: inputCursor=..., pageSize=5, returned=5, hasNext=true, nextCursor=...
+```
+
+每个测试类用 `@DirtiesContext` + 唯一命名的内存库
+（`jdbc:h2:mem:testdb-${random.uuid}`）隔离，互不共享数据。
+
+### 8.2 持久化（跨重启）
+
+```bash
+mvn -o package -DskipTests
+java -jar target/versioned-config-release-store-java-1.0-SNAPSHOT.jar --server.port=8090
+# 写入若干条目后 Ctrl+C，再以同样方式重启，GET 数据与版本历史仍在
+```
+
+默认文件库位于 `./data/configstore.mv.db`（已在 `.gitignore` 忽略）。

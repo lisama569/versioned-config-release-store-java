@@ -37,3 +37,7 @@ build/
 
 ### Mac OS ###
 .DS_Store
+### H2 file database & run artifacts ###
+/data/
+*.log
+app.pid
