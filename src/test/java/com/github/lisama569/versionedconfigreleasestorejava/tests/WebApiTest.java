@@ -141,8 +141,69 @@ class WebApiTest {
     }
 
     @Test
-    void paginationTraversal_overHttp() {
-        String prefix = "web.page." + System.nanoTime() + ".";
+    void windowEndpoints_overHttp() {
+        String key = "web.win." + System.nanoTime();
+        rest.postForEntity(url("/api/entries"),
+                new HttpEntity<>(Map.of("key", key, "value", "init"), json()), Map.class);
+        String requestId = "web-win-" + System.nanoTime();
+        String expireAt = java.time.Instant.now().plusSeconds(3600)
+                .truncatedTo(java.time.temporal.ChronoUnit.MILLIS).toString();
+        String newExpire = java.time.Instant.now().plusSeconds(7200)
+                .truncatedTo(java.time.temporal.ChronoUnit.MILLIS).toString();
+
+        // 创建带绝对时间窗的发布单
+        Map<String, Object> windowPayload = Map.of(
+                "requestId", requestId,
+                "entryKeys", List.of(key),
+                "remark", "window http",
+                "window", Map.of("expireAt", expireAt));
+        ResponseEntity<Map> created = rest.postForEntity(url("/api/releases"),
+                new HttpEntity<>(windowPayload, json()), Map.class);
+        assertEquals(org.springframework.http.HttpStatus.OK, created.getStatusCode());
+        assertEquals(expireAt, String.valueOf(created.getBody().get("expireAt")));
+        assertEquals(expireAt, String.valueOf(created.getBody().get("actualExpireAt")));
+        log.info("HTTP create with window: expireAt={}, actualExpireAt={}",
+                created.getBody().get("expireAt"), created.getBody().get("actualExpireAt"));
+
+        // 非法窗口：expireAt 与 ttlSeconds 同给 -> 409 INVALID_WINDOW
+        ResponseEntity<Map> invalid = rest.postForEntity(url("/api/releases"),
+                new HttpEntity<>(Map.of(
+                        "requestId", "web-win-bad-" + System.nanoTime(),
+                        "entryKeys", List.of(key),
+                        "window", Map.of("expireAt", expireAt, "ttlSeconds", 60)), json()),
+                Map.class);
+        assertEquals(HttpStatus.CONFLICT, invalid.getStatusCode());
+        assertEquals("INVALID_WINDOW", invalid.getBody().get("code"));
+
+        // 改期
+        ResponseEntity<Map> moved = rest.exchange(
+                url("/api/releases/" + requestId + "/window"),
+                org.springframework.http.HttpMethod.PUT,
+                new HttpEntity<>(Map.of("expireAt", newExpire), json()), Map.class);
+        assertEquals(HttpStatus.OK, moved.getStatusCode());
+        assertEquals(newExpire, String.valueOf(moved.getBody().get("actualExpireAt")));
+
+        // 时间窗维度查询
+        ResponseEntity<Map> expiring = rest.getForEntity(
+                url("/api/releases/windows?bucket=EXPIRING&limit=5"), Map.class);
+        assertEquals(HttpStatus.OK, expiring.getStatusCode());
+        log.info("HTTP EXPIRING page: nextCursor={}", expiring.getBody().get("nextCursor"));
+
+        // 非法 bucket -> 400
+        ResponseEntity<Map> badBucket = rest.getForEntity(
+                url("/api/releases/windows?bucket=NOPE"), Map.class);
+        assertEquals(HttpStatus.BAD_REQUEST, badBucket.getStatusCode());
+        assertEquals("INVALID_REQUEST", badBucket.getBody().get("code"));
+
+        // 取消窗口
+        ResponseEntity<Map> canceled = rest.postForEntity(
+                url("/api/releases/" + requestId + "/window/cancel"), null, Map.class);
+        assertEquals(HttpStatus.OK, canceled.getStatusCode());
+        assertEquals(null, canceled.getBody().get("actualExpireAt"));
+    }
+
+    @Test
+    void paginationTraversal_overHttp() {        String prefix = "web.page." + System.nanoTime() + ".";
         for (int i = 0; i < 7; i++) {
             rest.postForEntity(url("/api/entries"),
                     new HttpEntity<>(Map.of("key", prefix + i, "value", "v"), json()), Map.class);

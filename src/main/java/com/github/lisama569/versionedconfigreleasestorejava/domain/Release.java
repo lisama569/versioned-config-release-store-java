@@ -71,6 +71,20 @@ public class Release {
 
     private Instant rolledBackAt;
 
+    /** 生效时刻（可空）：到达该时刻才允许/会被自动发布；NULL 表示不延迟生效。 */
+    private Instant effectiveAt;
+
+    /** 绝对到期时刻（可空）：到期自动回滚；NULL 表示无绝对到期。 */
+    private Instant expireAt;
+
+    /** 相对有效期秒数（可空）：发布时刻 + ttl = 实际到期时刻；NULL 表示非 TTL 窗口。 */
+    private Long ttlSeconds;
+
+    /** 回滚触发来源：MANUAL/AUTO；历史回滚行为 NULL，读取归一化为 MANUAL。 */
+    @Enumerated(EnumType.STRING)
+    @Column(length = 20)
+    private RollbackTrigger rollbackTrigger;
+
     @OneToMany(mappedBy = "releaseSeq", fetch = FetchType.EAGER, cascade = CascadeType.ALL)
     private List<ReleaseItem> items = new ArrayList<>();
 
@@ -112,6 +126,69 @@ public class Release {
         return ALLOWED_NEXT.get(this.state) == target;
     }
 
+    /** 是否声明了生效时间窗（任意一个字段非空即算有窗口）。 */
+    public boolean hasWindow() {
+        return effectiveAt != null || expireAt != null || ttlSeconds != null;
+    }
+
+    /**
+     * 配置/改期生效时间窗。调用方（service）负责语义校验与状态前置校验，
+     * 这里只做赋值与时间戳维护。
+     */
+    public void configureWindow(Instant newEffectiveAt, Instant newExpireAt, Long newTtlSeconds,
+                                Instant now) {
+        this.effectiveAt = newEffectiveAt;
+        this.expireAt = newExpireAt;
+        this.ttlSeconds = newTtlSeconds;
+        this.updatedAt = now;
+    }
+
+    /** 取消时间窗：此后与"从未设置时间窗"的发布单完全一致，永不自动回滚。 */
+    public void clearWindow(Instant now) {
+        this.effectiveAt = null;
+        this.expireAt = null;
+        this.ttlSeconds = null;
+        this.updatedAt = now;
+    }
+
+    /**
+     * 实际到期时刻：绝对窗口取 {@code expireAt}；TTL 窗口在发布后取
+     * {@code publishedAt + ttlSeconds}，发布前尚无法确定（null）；无窗口恒为 null。
+     */
+    public Instant actualExpireAt() {
+        if (expireAt != null) {
+            return expireAt;
+        }
+        if (ttlSeconds != null && publishedAt != null) {
+            return publishedAt.plusSeconds(ttlSeconds);
+        }
+        return null;
+    }
+
+    /** 是否已声明绝对到期时刻（到期扫描只处理这部分；TTL 待发布后固化）。 */
+    public boolean hasConcreteDeadline() {
+        return actualExpireAt() != null;
+    }
+
+    /** 回滚触发来源；历史回滚行（列为 NULL）稳定归一化为 MANUAL。 */
+    public RollbackTrigger effectiveRollbackTrigger() {
+        return rollbackTrigger == null ? RollbackTrigger.MANUAL : rollbackTrigger;
+    }
+
+    public void markRollbackTrigger(RollbackTrigger trigger) {
+        this.rollbackTrigger = trigger;
+    }
+
+    /**
+     * 发布成功后：TTL 窗口在此把相对有效期固化为绝对到期时刻，
+     * 之后改期不再影响已确定的到期点；非 TTL 窗口不变。
+     */
+    public void materializeTtlDeadline(Instant publishInstant) {
+        if (ttlSeconds != null && expireAt == null) {
+            this.expireAt = publishInstant.plusSeconds(ttlSeconds);
+        }
+    }
+
     public void addItem(ReleaseItem item) {
         this.items.add(item);
     }
@@ -150,6 +227,22 @@ public class Release {
 
     public Instant getRolledBackAt() {
         return rolledBackAt;
+    }
+
+    public Instant getEffectiveAt() {
+        return effectiveAt;
+    }
+
+    public Instant getExpireAt() {
+        return expireAt;
+    }
+
+    public Long getTtlSeconds() {
+        return ttlSeconds;
+    }
+
+    public RollbackTrigger getRollbackTrigger() {
+        return rollbackTrigger;
     }
 
     public List<ReleaseItem> getItems() {
