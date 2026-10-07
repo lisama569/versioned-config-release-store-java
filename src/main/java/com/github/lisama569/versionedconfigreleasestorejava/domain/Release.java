@@ -71,6 +71,23 @@ public class Release {
 
     private Instant rolledBackAt;
 
+    /** 生效时间窗起点；null 表示"自发布起"。历史行该列为 NULL（无时间窗）。 */
+    private Instant windowStart;
+
+    /**
+     * 生效时间窗终点；到期（windowEnd <= now 且状态为 PUBLISHED）触发自动回滚。
+     * null 表示无到期点，永不参与自动回滚。历史行该列为 NULL。
+     */
+    private Instant windowEnd;
+
+    /** "从发布起生效多久"的声明时长（秒）；发布瞬间据此算出 windowEnd。 */
+    private Long windowDurationSeconds;
+
+    /** 回滚来源；未回滚时为 null。 */
+    @Enumerated(EnumType.STRING)
+    @Column(length = 20)
+    private RollbackReason rollbackReason;
+
     @OneToMany(mappedBy = "releaseSeq", fetch = FetchType.EAGER, cascade = CascadeType.ALL)
     private List<ReleaseItem> items = new ArrayList<>();
 
@@ -112,6 +129,28 @@ public class Release {
         return ALLOWED_NEXT.get(this.state) == target;
     }
 
+    /**
+     * 设置/替换生效时间窗。三个参数整体替换旧值；
+     * 全部传 null 等价于取消时间窗。仅允许在终态之前调用（服务层保证）。
+     */
+    public void applyWindow(Instant windowStart, Instant windowEnd, Long windowDurationSeconds) {
+        this.windowStart = windowStart;
+        this.windowEnd = windowEnd;
+        this.windowDurationSeconds = windowDurationSeconds;
+    }
+
+    /** 发布瞬间结算：若声明了时长而 windowEnd 尚未确定，则按发布时间推算。 */
+    public void settleWindowOnPublish(Instant publishedAt) {
+        if (this.windowEnd == null && this.windowDurationSeconds != null) {
+            this.windowEnd = publishedAt.plusSeconds(this.windowDurationSeconds);
+        }
+    }
+
+    /** 记录回滚来源（手动 / 到期自动）。 */
+    public void markRollbackReason(RollbackReason reason) {
+        this.rollbackReason = reason;
+    }
+
     public void addItem(ReleaseItem item) {
         this.items.add(item);
     }
@@ -150,6 +189,22 @@ public class Release {
 
     public Instant getRolledBackAt() {
         return rolledBackAt;
+    }
+
+    public Instant getWindowStart() {
+        return windowStart;
+    }
+
+    public Instant getWindowEnd() {
+        return windowEnd;
+    }
+
+    public Long getWindowDurationSeconds() {
+        return windowDurationSeconds;
+    }
+
+    public RollbackReason getRollbackReason() {
+        return rollbackReason;
     }
 
     public List<ReleaseItem> getItems() {

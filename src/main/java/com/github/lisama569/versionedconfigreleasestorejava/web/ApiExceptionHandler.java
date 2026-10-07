@@ -17,13 +17,18 @@ public class ApiExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(ApiExceptionHandler.class);
 
-    /** ENTRY_NOT_FOUND / RELEASE_NOT_FOUND 语义上是 404，其余业务冲突为 409。 */
+    /** ENTRY_NOT_FOUND / RELEASE_NOT_FOUND 语义上是 404；INVALID_WINDOW 是 400；其余业务冲突为 409。 */
     @ExceptionHandler(BusinessException.class)
     public ResponseEntity<Map<String, Object>> handleBusiness(BusinessException ex) {
         ConflictReason reason = ex.getReason();
-        HttpStatus status = (reason == ConflictReason.ENTRY_NOT_FOUND
-                || reason == ConflictReason.RELEASE_NOT_FOUND)
-                ? HttpStatus.NOT_FOUND : HttpStatus.CONFLICT;
+        HttpStatus status;
+        if (reason == ConflictReason.ENTRY_NOT_FOUND || reason == ConflictReason.RELEASE_NOT_FOUND) {
+            status = HttpStatus.NOT_FOUND;
+        } else if (reason == ConflictReason.INVALID_WINDOW) {
+            status = HttpStatus.BAD_REQUEST;
+        } else {
+            status = HttpStatus.CONFLICT;
+        }
         log.warn("business rejection: reason={}, status={}, message={}",
                 reason.name(), status.value(), ex.getMessage());
         return ResponseEntity.status(status).body(Map.of(

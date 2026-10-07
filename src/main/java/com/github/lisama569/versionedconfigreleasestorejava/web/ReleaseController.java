@@ -2,11 +2,14 @@ package com.github.lisama569.versionedconfigreleasestorejava.web;
 
 import com.github.lisama569.versionedconfigreleasestorejava.api.CreateReleaseRequest;
 import com.github.lisama569.versionedconfigreleasestorejava.api.ReleaseView;
+import com.github.lisama569.versionedconfigreleasestorejava.api.UpdateWindowRequest;
 import com.github.lisama569.versionedconfigreleasestorejava.service.ReleaseService;
 import com.github.lisama569.versionedconfigreleasestorejava.support.CursorPage;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -40,6 +43,30 @@ public class ReleaseController {
     @PostMapping("/{requestId}/rollback")
     public ReleaseView rollback(@PathVariable String requestId) {
         return releaseService.rollback(requestId);
+    }
+
+    @PutMapping("/{requestId}/window")
+    public ReleaseView updateWindow(@PathVariable String requestId,
+                                    @RequestBody(required = false) UpdateWindowRequest request) {
+        return releaseService.updateWindow(requestId, request);
+    }
+
+    @DeleteMapping("/{requestId}/window")
+    public ReleaseView clearWindow(@PathVariable String requestId) {
+        return releaseService.clearWindow(requestId);
+    }
+
+    @PostMapping("/{requestId}/auto-rollback")
+    public ReleaseView autoRollback(@PathVariable String requestId) {
+        return releaseService.rollbackAuto(requestId);
+    }
+
+    @GetMapping("/windows")
+    public CursorPage<ReleaseView> listByWindow(@RequestParam String status,
+                                                @RequestParam(required = false) String cursor,
+                                                @RequestParam(defaultValue = "50") int limit,
+                                                @RequestParam(required = false) Long withinSeconds) {
+        return releaseService.listByWindow(status, cursor, limit, withinSeconds);
     }
 
     @GetMapping("/{requestId}")

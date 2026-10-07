@@ -29,6 +29,16 @@ curl -s -X POST localhost:8080/api/releases/r1/submit
 curl -s -X POST localhost:8080/api/releases/r1/publish
 curl -s -X POST localhost:8080/api/releases/r1/rollback
 
+# 生效时间窗：只生效 1 小时，到期自动回滚（等效于手动回滚，rollbackReason=AUTO_EXPIRED）
+curl -s -X POST localhost:8080/api/releases -H 'Content-Type: application/json' \
+  -d '{"requestId":"r2","entryKeys":["feature.x"],"effectiveForSeconds":3600}'
+# 到点前可重设 / 取消时间窗
+curl -s -X PUT    localhost:8080/api/releases/r2/window -H 'Content-Type: application/json' \
+  -d '{"effectiveForSeconds":7200}'
+curl -s -X DELETE localhost:8080/api/releases/r2/window
+# 按时间窗维度分页查询：EXPIRING_SOON / EXPIRED_PENDING / AUTO_ROLLED_BACK
+curl -s "localhost:8080/api/releases/windows?status=EXPIRED_PENDING&limit=50"
+
 # 分页（键集游标，响应体含 nextCursor）
 curl -s "localhost:8080/api/entries?limit=50"
 curl -s "localhost:8080/api/entries/feature.x/revisions"
@@ -37,8 +47,9 @@ curl -s "localhost:8080/api/entries/feature.x/revisions"
 ## 测试
 
 ```bash
-mvn -o test        # 24 个用例，H2 内存库，离线、确定性、可重复
+mvn -o test        # 42 个用例，H2 内存库，离线、确定性、可重复
 ```
 
-覆盖并发冲突、重复提交、非法状态迁移、回滚前置条件、分页边界/持续写入、历史数据兼容、
+覆盖并发冲突、重复提交、非法状态迁移、回滚前置条件、时间窗到期自动回滚、
+手动/自动回滚并发相撞只生效一次、时间窗分页边界/持续写入、历史数据兼容、
 端到端 HTTP 错误码；日志打印输入与判定依据。

@@ -23,5 +23,9 @@ public enum ConflictReason {
     /** 回滚前置条件不满足（如发布后条目又被改动） */
     ROLLBACK_PRECONDITION_FAILED,
     /** 幂等键重复，但请求体与首次请求不一致 */
-    IDEMPOTENCY_KEY_MISMATCH
+    IDEMPOTENCY_KEY_MISMATCH,
+    /** 生效时间窗参数非法（互斥字段同时给出、终点不晚于起点、时长非正等） */
+    INVALID_WINDOW,
+    /** 自动回滚被触发时窗口尚未到期（或该发布单无时间窗） */
+    WINDOW_NOT_EXPIRED
 }
